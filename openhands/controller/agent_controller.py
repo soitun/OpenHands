@@ -214,7 +214,6 @@ class AgentController:
             elif isinstance(event, CmdOutputObservation):
                 logger.info(event, extra={'msg_type': 'OBSERVATION'})
             elif isinstance(event, AgentDelegateObservation):
-                self.state.history.on_event(event)
                 logger.info(event, extra={'msg_type': 'OBSERVATION'})
             elif isinstance(event, ErrorObservation):
                 logger.info(event, extra={'msg_type': 'OBSERVATION'})
@@ -504,25 +503,16 @@ class AgentController:
         else:
             self.state = state
 
-        # when restored from a previous session, the State object will have history, start_id, and end_id
-        # connect it to the event stream
-        self.state.history.set_event_stream(self.event_stream)
-
-        # if start_id was not set in State, we're starting fresh, at the top of the stream
-        start_id = self.state.start_id
-        if start_id == -1:
-            start_id = self.event_stream.get_latest_event_id() + 1
+        # Set the start_id in the state
+        if self.state.start_id == -1:
+            self.state.start_id = self.event_stream.get_latest_event_id() + 1
         else:
-            logger.debug(f'AgentController {self.id} restoring from event {start_id}')
+            logger.debug(
+                f'AgentController {self.id} restoring from event {self.state.start_id}'
+            )
 
-        # make sure history is in sync
-        self.state.start_id = start_id
-        self.state.history.start_id = start_id
-
-        # if there was an end_id saved in State, set it in history
-        # currently not used, later useful for delegates
-        if self.state.end_id > -1:
-            self.state.history.end_id = self.state.end_id
+        # Set the state in the event stream
+        self.event_stream.set_state(self.state)
 
     def _is_stuck(self):
         """Checks if the agent or its delegate is stuck in a loop.

@@ -65,7 +65,7 @@ class ShortTermHistory(list[Event]):
             start_id=start_id,
             end_id=end_id,
             reverse=reverse,
-            filter_out_type=self.filter_out,
+            filter_out_types=self.filter_out,
         ):
             # TODO add summaries
             # and filter out events that were included in a summary
@@ -89,7 +89,7 @@ class ShortTermHistory(list[Event]):
             (
                 event
                 for event in self._event_stream.get_events(
-                    end_id=end_id, reverse=True, filter_out_type=self.filter_out
+                    end_id=end_id, reverse=True, filter_out_types=self.filter_out
                 )
                 if isinstance(event, Action)
             ),
@@ -107,7 +107,7 @@ class ShortTermHistory(list[Event]):
             (
                 event
                 for event in self._event_stream.get_events(
-                    end_id=end_id, reverse=True, filter_out_type=self.filter_out
+                    end_id=end_id, reverse=True, filter_out_types=self.filter_out
                 )
                 if isinstance(event, Observation)
             ),
@@ -155,7 +155,7 @@ class ShortTermHistory(list[Event]):
             for event in self._event_stream.get_events(
                 start_id=start_id,
                 end_id=end_id,
-                filter_out_type=self.filter_out,
+                filter_out_types=self.filter_out,
             )
         )
 
