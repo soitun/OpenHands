@@ -85,7 +85,7 @@ class State:
     # root agent has level 0, and every delegate increases the level by one
     delegate_level: int = 0
     delegates: dict[tuple[int, int], tuple[str, str]] = field(default_factory=dict)
-
+    almost_stuck: bool = False
     # NOTE: This will never be used by the controller, but it can be used by different
     # evaluation tasks to store extra data needed to track the progress/state of the task.
     extra_data: dict[str, Any] = field(default_factory=dict)

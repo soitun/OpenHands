@@ -17,6 +17,7 @@ from openhands.events.action.empty import NullAction
 from openhands.events.action.message import MessageAction
 from openhands.events.observation import Observation
 from openhands.events.observation.agent import AgentStateChangedObservation
+from openhands.events.observation.commands import CmdOutputObservation
 from openhands.events.observation.delegate import AgentDelegateObservation
 from openhands.events.observation.empty import NullObservation
 from openhands.events.serialization.event import event_from_dict, event_to_dict
@@ -114,21 +115,27 @@ class EventStream:
         if end_id is None:
             end_id = self.state.end_id if self.state.end_id != -1 else self._cur_id - 1
 
-        exclude_types = filter_out_types if filter_out_types is not None else self.filter_out
+        exclude_types = (
+            filter_out_types if filter_out_types is not None else self.filter_out
+        )
 
-        event_range = range(end_id, start_id - 1, -1) if reverse else range(start_id, end_id + 1)
+        event_range = (
+            range(end_id, start_id - 1, -1) if reverse else range(start_id, end_id + 1)
+        )
 
         for event_id in event_range:
             try:
                 event = self.get_event(event_id)
-                
+
                 # Filter out excluded event types
                 if isinstance(event, exclude_types):
                     continue
-                
+
                 # Filter out delegate events
-                if any(delegate_start < event.id < delegate_end
-                       for delegate_start, delegate_end in self.state.delegates.keys()):
+                if any(
+                    delegate_start < event.id < delegate_end
+                    for delegate_start, delegate_end in self.state.delegates.keys()
+                ):
                     continue
 
                 yield event
@@ -231,7 +238,7 @@ class EventStream:
         self.file_store.delete(f'sessions/{self.sid}')
         self._cur_id = 0
         # self._subscribers = {}
-        self._reinitialize_from_file_store() 
+        self._reinitialize_from_file_store()
 
     def get_last_action(self, end_id: int = -1) -> Action | None:
         """Return the last action from the event stream, filtered to exclude unwanted events."""
@@ -302,6 +309,8 @@ class EventStream:
 
     def get_last_events(self, n: int) -> list[Event]:
         """Return the last n events from the event stream."""
+        # dummy agent is using this
+        # it works, but it's not great to store temporary lists now just for a test
         end_id = self._cur_id - 1
         start_id = max(0, end_id - n + 1)
 
@@ -328,3 +337,66 @@ class EventStream:
             if isinstance(event, AgentDelegateObservation):
                 return True
         return False
+
+    def get_events_as_list(self) -> list[Event]:
+        """Return the history as a list of Event objects."""
+        return list(self.get_events())
+
+    # history is now available as a filtered stream of events, rather than list of pairs of (Action, Observation)
+    # we rebuild the pairs here
+    # for compatibility with the existing output format in evaluations
+    def compatibility_for_eval_history_pairs(self) -> list[tuple[dict, dict]]:
+        history_pairs = []
+
+        for action, observation in self.get_pairs():
+            history_pairs.append((event_to_dict(action), event_to_dict(observation)))
+
+        return history_pairs
+
+    def get_pairs(self) -> list[tuple[Action, Observation]]:
+        """Return the history as a list of tuples (action, observation)."""
+        tuples: list[tuple[Action, Observation]] = []
+        action_map: dict[int, Action] = {}
+        observation_map: dict[int, Observation] = {}
+
+        # runnable actions are set as cause of observations
+        # (MessageAction, NullObservation) for source=USER
+        # (MessageAction, NullObservation) for source=AGENT
+        # (other_action?, NullObservation)
+        # (NullAction, CmdOutputObservation) background CmdOutputObservations
+
+        for event in self.get_events_as_list():
+            if event.id is None or event.id == -1:
+                logger.debug(f'Event {event} has no ID')
+
+            if isinstance(event, Action):
+                action_map[event.id] = event
+
+            if isinstance(event, Observation):
+                if event.cause is None or event.cause == -1:
+                    logger.debug(f'Observation {event} has no cause')
+
+                if event.cause is None:
+                    # runnable actions are set as cause of observations
+                    # NullObservations have no cause
+                    continue
+
+                observation_map[event.cause] = event
+
+        for action_id, action in action_map.items():
+            observation = observation_map.get(action_id)
+            if observation:
+                # observation with a cause
+                tuples.append((action, observation))
+            else:
+                tuples.append((action, NullObservation('')))
+
+        for cause_id, observation in observation_map.items():
+            if cause_id not in action_map:
+                if isinstance(observation, NullObservation):
+                    continue
+                if not isinstance(observation, CmdOutputObservation):
+                    logger.debug(f'Observation {observation} has no cause')
+                tuples.append((NullAction(), observation))
+
+        return tuples.copy()
