@@ -9,7 +9,6 @@ from openhands.core.logger import openhands_logger as logger
 from openhands.core.utils import json
 from openhands.events.action.action import Action
 from openhands.events.action.agent import (
-    AgentDelegateAction,
     AgentFinishAction,
     ChangeAgentStateAction,
 )
@@ -134,7 +133,11 @@ class EventStream:
                 # Filter out delegate events
                 if any(
                     delegate_start < event.id < delegate_end
-                    for delegate_start, delegate_end in self.state.delegates.keys()
+                    for delegate_start, (
+                        _,
+                        _,
+                        delegate_end,
+                    ) in self.state.delegates.items()
                 ):
                     continue
 
@@ -184,50 +187,10 @@ class EventStream:
         if event.id is not None:
             self.file_store.write(self._get_filename_for_id(event.id), json.dumps(data))
 
-        # TODO: maybe we should do this on the fly when we get events
-        if isinstance(event, AgentDelegateObservation):
-            self._handle_delegate_observation(event)
-
         for key in sorted(self._subscribers.keys()):
             stack = self._subscribers[key]
             callback = stack[-1]
             asyncio.create_task(callback(event))
-
-    def _handle_delegate_observation(self, event: AgentDelegateObservation):
-        if self.state is None:
-            raise ValueError('State has not been set for EventStream')
-
-        logger.debug('AgentDelegateObservation received')
-
-        # figure out what this delegate's actions were
-        # from the last AgentDelegateAction to this AgentDelegateObservation
-        # and save their ids as start and end ids
-        # in order to use later to exclude them from parent stream
-        # or summarize them
-        delegate_end = event.id
-        delegate_start = -1
-        delegate_agent: str = ''
-        delegate_task: str = ''
-        for prev_event in self.get_events(end_id=event.id - 1, reverse=True):
-            if isinstance(prev_event, AgentDelegateAction):
-                delegate_start = prev_event.id
-                delegate_agent = prev_event.agent
-                delegate_task = prev_event.inputs.get('task', '')
-                break
-
-        if delegate_start == -1:
-            logger.error(
-                f'No AgentDelegateAction found for AgentDelegateObservation with id={delegate_end}'
-            )
-            return
-
-        self.state.delegates[(delegate_start, delegate_end)] = (
-            delegate_agent,
-            delegate_task,
-        )
-        logger.debug(
-            f'Delegate {delegate_agent} with task {delegate_task} ran from id={delegate_start} to id={delegate_end}'
-        )
 
     def filtered_events_by_source(self, source: EventSource):
         for event in self.get_events():

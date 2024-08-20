@@ -183,7 +183,10 @@ class AgentController:
             elif event.source == EventSource.AGENT and event.wait_for_response:
                 await self.set_agent_state_to(AgentState.AWAITING_USER_INPUT)
         elif isinstance(event, AgentDelegateAction):
+            self._handle_delegate_action(event)
             await self.start_delegate(event)
+        elif isinstance(event, AgentDelegateObservation):
+            self._handle_delegate_observation(event)
         elif isinstance(event, AddTaskAction):
             self.state.root_task.add_subtask(event.parent, event.goal, event.subtasks)
         elif isinstance(event, ModifyTaskAction):
@@ -217,6 +220,36 @@ class AgentController:
                 logger.info(event, extra={'msg_type': 'OBSERVATION'})
             elif isinstance(event, ErrorObservation):
                 logger.info(event, extra={'msg_type': 'OBSERVATION'})
+
+    def _handle_delegate_action(self, event: AgentDelegateAction):
+        logger.debug('AgentDelegateAction received')
+        delegate_start = event.id
+        delegate_agent = event.agent
+        delegate_task = event.inputs.get('task', '')
+
+        # Initialize the delegate entry with end_id as None
+        # end id = -1 means that the delegate has not ended yet
+        self.state.delegates[delegate_start] = (delegate_agent, delegate_task, -1)
+        logger.debug(
+            f'Delegate {delegate_agent} with task {delegate_task} started at id={delegate_start}'
+        )
+
+    def _handle_delegate_observation(self, event: AgentDelegateObservation):
+        logger.debug('AgentDelegateObservation received')
+        delegate_end = event.id
+
+        # Find the corresponding delegate action and update its end_id
+        for delegate_start, (delegate_agent, delegate_task, _) in self.state.delegates.items():
+            if self.state.delegates[delegate_start][2] == -1:
+                self.state.delegates[delegate_start] = (delegate_agent, delegate_task, delegate_end)
+                logger.debug(
+                    f'Delegate {delegate_agent} with task {delegate_task} ended at id={delegate_end}'
+                )
+                return
+
+        logger.error(
+            f'No matching AgentDelegateAction found for AgentDelegateObservation with id={delegate_end}'
+        )
 
     def reset_task(self):
         """Resets the agent's task."""
