@@ -9,7 +9,7 @@ repository = "https://github.com/All-Hands-AI/OpenHands"
 include = ["poetry.lock"]
 
 [tool.poetry.dependencies]
-python = "^3.11"
+python = "^3.12"
 datasets = "*"
 pandas = "*"
 litellm = "*"

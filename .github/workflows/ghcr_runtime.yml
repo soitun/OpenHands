@@ -32,7 +32,7 @@ jobs:
     strategy:
       matrix:
         image: ['runtime']
-        base_image: ['nikolaik/python-nodejs:python3.11-nodejs22', 'python:3.11-bookworm', 'node:22-bookworm']
+        base_image: ['nikolaik/python-nodejs:python3.12-nodejs22', 'python:3.12-bookworm', 'node:22-bookworm']
         platform: ['amd64', 'arm64']
     outputs:
       tags: ${{ steps.capture-tags.outputs.tags }}
@@ -63,7 +63,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
           cache: 'poetry'
       - name: Install Python dependencies using Poetry
         run: make install-python-dependencies
@@ -159,7 +159,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
           cache: 'poetry'
       - name: Install Python dependencies using Poetry
         run: make install-python-dependencies
@@ -216,7 +216,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
           cache: 'poetry'
       - name: Install Python dependencies using Poetry
         run: make install-python-dependencies

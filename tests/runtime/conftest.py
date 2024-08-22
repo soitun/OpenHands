@@ -73,8 +73,8 @@ def container_image(request):
             request.param = request.config.getoption('--container-image')
         if request.param is None:
             request.param = pytest.param(
-                'nikolaik/python-nodejs:python3.11-nodejs22',
-                'python:3.11-bookworm',
+                'nikolaik/python-nodejs:python3.12-nodejs22',
+                'python:3.12-bookworm',
                 'node:22-bookworm',
                 'golang:1.23-bookworm',
             )
