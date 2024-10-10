@@ -5,8 +5,8 @@ import os
 import pathlib
 import subprocess
 import time
-from concurrent.futures import ProcessPoolExecutor
-from typing import Any, Awaitable, Callable
+import traceback
+from typing import Any, Awaitable, Callable, TextIO
 
 import pandas as pd
 from pydantic import BaseModel
@@ -40,24 +40,29 @@ class EvalMetadata(BaseModel):
     def model_dump_json(self, *args, **kwargs):
         dumped = super().model_dump_json(*args, **kwargs)
         dumped_dict = json.loads(dumped)
-        logger.debug(f'Dumped metadata: {dumped_dict}')
         # avoid leaking sensitive information
         dumped_dict['llm_config'] = self.llm_config.to_safe_dict()
+        logger.debug(f'Dumped metadata: {dumped_dict}')
         return json.dumps(dumped_dict)
 
 
 class EvalOutput(BaseModel):
     # NOTE: User-specified
     instance_id: str
-    instruction: str
     # output of the evaluation
     # store anything that is needed for the score calculation
     test_result: dict[str, Any]
 
+    instruction: str | None = None
+
     # Interaction info
-    metadata: EvalMetadata
-    history: list[tuple[dict[str, Any], dict[str, Any]]]
-    metrics: dict[str, Any]
+    metadata: EvalMetadata | None = None
+    # list[tuple[dict[str, Any], dict[str, Any]]] - for compatibility with the old format
+    history: (
+        list[dict[str, Any]] | list[tuple[dict[str, Any], dict[str, Any]]] | None
+    ) = None
+    llm_completions: list[dict[str, Any]] | None = None
+    metrics: dict[str, Any] | None = None
     error: str | None = None
 
     # Optionally save the input test instance
@@ -65,16 +70,24 @@ class EvalOutput(BaseModel):
 
     def model_dump(self, *args, **kwargs):
         dumped_dict = super().model_dump(*args, **kwargs)
+        # Remove None values
+        dumped_dict = {k: v for k, v in dumped_dict.items() if v is not None}
         # Apply custom serialization for metadata (to avoid leaking sensitive information)
-        dumped_dict['metadata'] = self.metadata.model_dump()
+        if self.metadata is not None:
+            dumped_dict['metadata'] = self.metadata.model_dump()
         return dumped_dict
 
     def model_dump_json(self, *args, **kwargs):
         dumped = super().model_dump_json(*args, **kwargs)
         dumped_dict = json.loads(dumped)
         # Apply custom serialization for metadata (to avoid leaking sensitive information)
-        dumped_dict['metadata'] = json.loads(self.metadata.model_dump_json())
+        if 'metadata' in dumped_dict:
+            dumped_dict['metadata'] = json.loads(self.metadata.model_dump_json())
         return json.dumps(dumped_dict)
+
+
+class EvalException(Exception):
+    pass
 
 
 def codeact_user_response(
@@ -227,56 +240,129 @@ def prepare_dataset(
     return pd.DataFrame(new_dataset)
 
 
+def update_progress(
+    result: EvalOutput,
+    pbar: tqdm,
+    output_fp: TextIO,
+):
+    """Update the progress bar and write the result to the output file."""
+    pbar.update(1)
+    pbar.set_description(f'Instance {result.instance_id}')
+    pbar.set_postfix_str(f'Test Result: {result.test_result}')
+    logger.info(
+        f'Finished evaluation for instance {result.instance_id}: {str(result.test_result)[:300]}...\n'
+    )
+    output_fp.write(json.dumps(result.model_dump()) + '\n')
+    output_fp.flush()
+
+
+def assert_and_raise(condition: bool, msg: str):
+    """Raise an EvalException if the condition is not met.
+
+    This will be used in conjunction with _process_instance_wrapper to handle retries. An EvalException should trigger a retry.
+    """
+    if not condition:
+        raise EvalException(msg)
+
+
+def _process_instance_wrapper(
+    process_instance_func: Callable[[pd.Series, EvalMetadata, bool], EvalOutput],
+    instance: pd.Series,
+    metadata: EvalMetadata,
+    use_mp: bool,
+    max_retries: int = 5,
+) -> EvalOutput:
+    """Wrap the process_instance_func to handle retries and errors.
+
+    Retry an instance up to max_retries times if it fails (e.g., due to transient network/runtime issues).
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            result = process_instance_func(instance, metadata, use_mp)
+            return result
+        except Exception as e:
+            error = str(e)
+            stacktrace = traceback.format_exc()
+            if attempt == max_retries:
+                logger.exception(e)
+                msg = (
+                    '-' * 10
+                    + '\n'
+                    + f'Error in instance [{instance.instance_id}]: {error}. Stacktrace:\n{stacktrace}'
+                    + '\n'
+                    + f'[Encountered after {max_retries} retries. Please check the logs and report the issue.]'
+                    + '-' * 10
+                )
+                # Raise an error after all retries & stop the evaluation
+                logger.exception(e)
+                raise RuntimeError(
+                    f'Maximum error retries reached for instance {instance.instance_id}'
+                ) from e
+            msg = (
+                '-' * 10
+                + '\n'
+                + f'Error in instance [{instance.instance_id}]: {error}. Stacktrace:\n{stacktrace}'
+                + '\n'
+                + '-' * 10
+                + f'[The above error occurred. Retrying... (attempt {attempt + 1} of {max_retries})]'
+                + '-' * 10
+                + '\n'
+            )
+            logger.error(msg)
+            if use_mp:
+                print(msg)  # use print to directly print to console
+            time.sleep(5)
+
+
+def _process_instance_wrapper_mp(args):
+    """Wrapper for multiprocessing, especially for imap_unordered."""
+    return _process_instance_wrapper(*args)
+
+
 def run_evaluation(
     dataset: pd.DataFrame,
-    metadata: EvalMetadata,
+    metadata: EvalMetadata | None,
     output_file: str,
     num_workers: int,
     process_instance_func: Callable[
         [pd.Series, EvalMetadata, bool], Awaitable[EvalOutput]
     ],
+    max_retries: int = 5,  # number of retries for each instance
 ):
     use_multiprocessing = num_workers > 1
-    logger.info(
-        f'Evaluation started with Agent {metadata.agent_class}:\n'
-        f'model {metadata.llm_config.model}, max iterations {metadata.max_iterations}.\n'
-    )
-    pbar = tqdm(total=len(dataset))
-    output_fp = open(output_file, 'a')
 
-    def update_progress(future):
-        pbar.update(1)
-        output: EvalOutput = future.result() if use_multiprocessing else future
-
-        pbar.set_description(f'Instance {output.instance_id}')
-        pbar.set_postfix_str(f'Test Result: {output.test_result}')
+    if metadata is not None:
         logger.info(
-            f'Finished evaluation for instance {output.instance_id}: {str(output.test_result)[:300]}...\n'
+            f'Evaluation started with Agent {metadata.agent_class}:\n'
+            f'model {metadata.llm_config.model}, max iterations {metadata.max_iterations}.\n'
         )
-        output_fp.write(json.dumps(output.model_dump()) + '\n')
-        output_fp.flush()
+    else:
+        logger.info(f'Evaluation started with {num_workers} workers.')
+
+    total_instances = len(dataset)
+    pbar = tqdm(total=total_instances, desc='Instances processed')
+    output_fp = open(output_file, 'a')
 
     try:
         if use_multiprocessing:
-            with ProcessPoolExecutor(num_workers) as executor:
-                futures = []
-                for _, instance in dataset.iterrows():
-                    future = executor.submit(
-                        process_instance_func,
-                        instance,
-                        metadata,
-                        bool(num_workers > 1),
-                    )
-                    future.add_done_callback(update_progress)
-                    futures.append(future)
-                for future in futures:
-                    future.result()
-        # Use plain for loop for single process for easier debugging
+            with mp.Pool(num_workers) as pool:
+                args_iter = (
+                    (process_instance_func, instance, metadata, True, max_retries)
+                    for _, instance in dataset.iterrows()
+                )
+                results = pool.imap_unordered(_process_instance_wrapper_mp, args_iter)
+                for result in results:
+                    update_progress(result, pbar, output_fp)
         else:
-            assert num_workers == 1
             for _, instance in dataset.iterrows():
-                output = process_instance_func(instance, metadata, False)
-                update_progress(output)
+                result = _process_instance_wrapper(
+                    process_instance_func=process_instance_func,
+                    instance=instance,
+                    metadata=metadata,
+                    use_mp=False,
+                    max_retries=max_retries,
+                )
+                update_progress(result, pbar, output_fp)
 
     except KeyboardInterrupt:
         print('\nKeyboardInterrupt received. Cleaning up...\n')
@@ -302,18 +388,27 @@ def reset_logger_for_multiprocessing(
     # Remove all existing handlers from logger
     for handler in logger.handlers[:]:
         logger.removeHandler(handler)
-    # add back the console handler to print ONE line
-    logger.addHandler(get_console_handler())
+
+    # add console handler to print ONE line
+    console_handler = get_console_handler(log_level=logging.INFO)
+    console_handler.setFormatter(
+        logging.Formatter(
+            f'Instance {instance_id} - ' + '%(asctime)s - %(levelname)s - %(message)s'
+        )
+    )
+    logger.addHandler(console_handler)
     logger.info(
         f'Starting evaluation for instance {instance_id}.\n'
         f'Hint: run "tail -f {log_file}" to see live logs in a separate shell'
     )
-    # Remove all existing handlers from logger
-    for handler in logger.handlers[:]:
-        logger.removeHandler(handler)
+    # Only log WARNING or higher to console
+    console_handler.setLevel(logging.WARNING)
+
+    # Log INFO and above to file
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
     file_handler = logging.FileHandler(log_file)
     file_handler.setFormatter(
         logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     )
+    file_handler.setLevel(logging.INFO)
     logger.addHandler(file_handler)

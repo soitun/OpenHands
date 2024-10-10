@@ -1,8 +1,8 @@
 import os
 import tempfile
 import threading
-import time
 import uuid
+from typing import Callable
 from zipfile import ZipFile
 
 import docker
@@ -10,9 +10,11 @@ import requests
 import tenacity
 
 from openhands.core.config import AppConfig
+from openhands.core.logger import DEBUG
 from openhands.core.logger import openhands_logger as logger
 from openhands.events import EventStream
 from openhands.events.action import (
+    ActionConfirmationStatus,
     BrowseInteractiveAction,
     BrowseURLAction,
     CmdRunAction,
@@ -25,6 +27,7 @@ from openhands.events.observation import (
     ErrorObservation,
     NullObservation,
     Observation,
+    UserRejectObservation,
 )
 from openhands.events.serialization import event_to_dict, observation_from_dict
 from openhands.events.serialization.action import ACTION_TYPE_TO_CLASS
@@ -32,12 +35,13 @@ from openhands.runtime.builder import DockerRuntimeBuilder
 from openhands.runtime.plugins import PluginRequirement
 from openhands.runtime.runtime import Runtime
 from openhands.runtime.utils import find_available_tcp_port
+from openhands.runtime.utils.request import send_request_with_retry
 from openhands.runtime.utils.runtime_build import build_runtime_image
+from openhands.utils.tenacity_stop import stop_if_should_exit
 
 
 class LogBuffer:
-    """
-    Synchronous buffer for Docker container logs.
+    """Synchronous buffer for Docker container logs.
 
     This class provides a thread-safe way to collect, store, and retrieve logs
     from a Docker container. It uses a list to store log lines and provides methods
@@ -45,13 +49,16 @@ class LogBuffer:
     """
 
     def __init__(self, container: docker.models.containers.Container):
+        self.client_ready = False
+        self.init_msg = 'Runtime client initialized.'
+
         self.buffer: list[str] = []
         self.lock = threading.Lock()
+        self._stop_event = threading.Event()
         self.log_generator = container.logs(stream=True, follow=True)
         self.log_stream_thread = threading.Thread(target=self.stream_logs)
         self.log_stream_thread.daemon = True
         self.log_stream_thread.start()
-        self._stop_event = threading.Event()
 
     def append(self, log_line: str):
         with self.lock:
@@ -75,9 +82,12 @@ class LogBuffer:
                 if self._stop_event.is_set():
                     break
                 if log_line:
-                    self.append(log_line.decode('utf-8').rstrip())
+                    decoded_line = log_line.decode('utf-8').rstrip()
+                    self.append(decoded_line)
+                    if self.init_msg in decoded_line:
+                        self.client_ready = True
         except Exception as e:
-            logger.error(f'Error in stream_logs: {e}')
+            logger.error(f'Error streaming docker logs: {e}')
 
     def __del__(self):
         if self.log_stream_thread.is_alive():
@@ -86,7 +96,7 @@ class LogBuffer:
             )
             self.close(timeout=5)
 
-    def close(self, timeout: float = 10.0):
+    def close(self, timeout: float = 5.0):
         self._stop_event.set()
         self.log_stream_thread.join(timeout)
 
@@ -94,6 +104,14 @@ class LogBuffer:
 class EventStreamRuntime(Runtime):
     """This runtime will subscribe the event stream.
     When receive an event, it will send the event to runtime-client which run inside the docker environment.
+    From the sid also an instance_id is generated in combination with a UID.
+
+    Args:
+        config (AppConfig): The application configuration.
+        event_stream (EventStream): The event stream to subscribe to.
+        sid (str, optional): The session ID. Defaults to 'default'.
+        plugins (list[PluginRequirement] | None, optional): List of plugin requirements. Defaults to None.
+        env_vars (dict[str, str] | None, optional): Environment variables to set. Defaults to None.
     """
 
     container_name_prefix = 'openhands-sandbox-'
@@ -105,57 +123,75 @@ class EventStreamRuntime(Runtime):
         sid: str = 'default',
         plugins: list[PluginRequirement] | None = None,
         env_vars: dict[str, str] | None = None,
+        status_message_callback: Callable | None = None,
     ):
         self.config = config
-        self._port = find_available_tcp_port()
-        self.api_url = f'http://{self.config.sandbox.api_hostname}:{self._port}'
+        self._host_port = 30000  # initial dummy value
+        self._container_port = 30001  # initial dummy value
+        self.api_url = f'{self.config.sandbox.local_runtime_url}:{self._container_port}'
         self.session = requests.Session()
-
         self.instance_id = (
             sid + '_' + str(uuid.uuid4()) if sid is not None else str(uuid.uuid4())
         )
+        self.status_message_callback = status_message_callback
+
+        self.send_status_message('STATUS$STARTING_RUNTIME')
         self.docker_client: docker.DockerClient = self._init_docker_client()
         self.base_container_image = self.config.sandbox.base_container_image
         self.runtime_container_image = self.config.sandbox.runtime_container_image
         self.container_name = self.container_name_prefix + self.instance_id
-
         self.container = None
         self.action_semaphore = threading.Semaphore(1)  # Ensure one action at a time
 
         self.runtime_builder = DockerRuntimeBuilder(self.docker_client)
-        logger.debug(f'EventStreamRuntime `{sid}` config:\n{self.config}')
+        logger.debug(f'EventStreamRuntime `{self.instance_id}`')
 
         # Buffer for container logs
         self.log_buffer: LogBuffer | None = None
-        self.startup_done = False
 
         if self.config.sandbox.runtime_extra_deps:
-            logger.info(
+            logger.debug(
                 f'Installing extra user-provided dependencies in the runtime image: {self.config.sandbox.runtime_extra_deps}'
             )
 
+        self.skip_container_logs = (
+            os.environ.get('SKIP_CONTAINER_LOGS', 'false').lower() == 'true'
+        )
         if self.runtime_container_image is None:
             if self.base_container_image is None:
                 raise ValueError(
                     'Neither runtime container image nor base container image is set'
                 )
+            logger.info('Preparing container, this might take a few minutes...')
+            self.send_status_message('STATUS$STARTING_CONTAINER')
             self.runtime_container_image = build_runtime_image(
                 self.base_container_image,
                 self.runtime_builder,
                 extra_deps=self.config.sandbox.runtime_extra_deps,
+                force_rebuild=self.config.sandbox.force_rebuild_runtime,
             )
         self.container = self._init_container(
-            self.sandbox_workspace_dir,
-            mount_dir=self.config.workspace_mount_path,
+            sandbox_workspace_dir=self.config.workspace_mount_path_in_sandbox,  # e.g. /workspace
+            mount_dir=self.config.workspace_mount_path,  # e.g. /opt/openhands/_test_workspace
             plugins=plugins,
         )
+
         # will initialize both the event stream and the env vars
-        super().__init__(config, event_stream, sid, plugins, env_vars)
+        super().__init__(
+            config, event_stream, sid, plugins, env_vars, status_message_callback
+        )
+
+        logger.info('Waiting for client to become ready...')
+        self.send_status_message('STATUS$WAITING_FOR_CLIENT')
+
+        self._wait_until_alive()
+
+        self.setup_initial_env()
 
         logger.info(
             f'Container initialized with plugins: {[plugin.name for plugin in self.plugins]}'
         )
-        logger.info(f'Container initialized with env vars: {env_vars}')
+        self.send_status_message(' ')
 
     @staticmethod
     def _init_docker_client() -> docker.DockerClient:
@@ -163,12 +199,12 @@ class EventStreamRuntime(Runtime):
             return docker.from_env()
         except Exception as ex:
             logger.error(
-                'Launch docker client failed. Please make sure you have installed docker and started the docker daemon.'
+                'Launch docker client failed. Please make sure you have installed docker and started docker desktop/daemon.'
             )
             raise ex
 
     @tenacity.retry(
-        stop=tenacity.stop_after_attempt(5),
+        stop=tenacity.stop_after_attempt(5) | stop_if_should_exit(),
         wait=tenacity.wait_exponential(multiplier=1, min=4, max=60),
     )
     def _init_container(
@@ -178,33 +214,56 @@ class EventStreamRuntime(Runtime):
         plugins: list[PluginRequirement] | None = None,
     ):
         try:
-            logger.info(
-                f'Starting container with image: {self.runtime_container_image} and name: {self.container_name}'
-            )
+            logger.info('Preparing to start container...')
+            self.send_status_message('STATUS$PREPARING_CONTAINER')
             plugin_arg = ''
             if plugins is not None and len(plugins) > 0:
                 plugin_arg = (
                     f'--plugins {" ".join([plugin.name for plugin in plugins])} '
                 )
 
-            network_mode: str | None = None
-            port_mapping: dict[str, int] | None = None
-            if self.config.sandbox.use_host_network:
-                network_mode = 'host'
+            self._host_port = self._find_available_port()
+            self._container_port = (
+                self._host_port
+            )  # in future this might differ from host port
+            self.api_url = (
+                f'{self.config.sandbox.local_runtime_url}:{self._container_port}'
+            )
+
+            use_host_network = self.config.sandbox.use_host_network
+            network_mode: str | None = 'host' if use_host_network else None
+            port_mapping: dict[str, list[dict[str, str]]] | None = (
+                None
+                if use_host_network
+                else {
+                    f'{self._container_port}/tcp': [{'HostPort': str(self._host_port)}]
+                }
+            )
+
+            if use_host_network:
                 logger.warn(
                     'Using host network mode. If you are using MacOS, please make sure you have the latest version of Docker Desktop and enabled host network feature: https://docs.docker.com/network/drivers/host/#docker-desktop'
                 )
-            else:
-                port_mapping = {f'{self._port}/tcp': self._port}
 
-            if mount_dir is not None:
+            # Combine environment variables
+            environment = {
+                'port': str(self._container_port),
+                'PYTHONUNBUFFERED': 1,
+            }
+            if self.config.debug or DEBUG:
+                environment['DEBUG'] = 'true'
+
+            logger.debug(f'Workspace Base: {self.config.workspace_base}')
+            if mount_dir is not None and sandbox_workspace_dir is not None:
+                # e.g. result would be: {"/home/user/openhands/workspace": {'bind': "/workspace", 'mode': 'rw'}}
                 volumes = {mount_dir: {'bind': sandbox_workspace_dir, 'mode': 'rw'}}
-                logger.info(f'Mount dir: {sandbox_workspace_dir}')
+                logger.debug(f'Mount dir: {mount_dir}')
             else:
                 logger.warn(
-                    'Mount dir is not set, will not mount the workspace directory to the container.'
+                    'Warning: Mount dir is not set, will not mount the workspace directory to the container!\n'
                 )
                 volumes = None
+            logger.debug(f'Sandbox workspace: {sandbox_workspace_dir}')
 
             if self.config.sandbox.browsergym_eval_env is not None:
                 browsergym_arg = (
@@ -212,13 +271,14 @@ class EventStreamRuntime(Runtime):
                 )
             else:
                 browsergym_arg = ''
+
             container = self.docker_client.containers.run(
                 self.runtime_container_image,
                 command=(
-                    f'/openhands/miniforge3/bin/mamba run --no-capture-output -n base '
-                    'PYTHONUNBUFFERED=1 poetry run '
-                    f'python -u -m openhands.runtime.client.client {self._port} '
-                    f'--working-dir {sandbox_workspace_dir} '
+                    f'/openhands/micromamba/bin/micromamba run -n openhands '
+                    f'poetry run '
+                    f'python -u -m openhands.runtime.client.client {self._container_port} '
+                    f'--working-dir "{sandbox_workspace_dir}" '
                     f'{plugin_arg}'
                     f'--username {"openhands" if self.config.run_as_openhands else "root"} '
                     f'--user-id {self.config.sandbox.user_id} '
@@ -226,73 +286,61 @@ class EventStreamRuntime(Runtime):
                 ),
                 network_mode=network_mode,
                 ports=port_mapping,
-                working_dir='/openhands/code/',
+                working_dir='/openhands/code/',  # do not change this!
                 name=self.container_name,
                 detach=True,
-                environment={'DEBUG': 'true'} if self.config.debug else None,
+                environment=environment,
                 volumes=volumes,
             )
             self.log_buffer = LogBuffer(container)
             logger.info(f'Container started. Server url: {self.api_url}')
+            self.send_status_message('STATUS$CONTAINER_STARTED')
             return container
         except Exception as e:
-            logger.error('Failed to start container')
+            logger.error(
+                f'Error: Instance {self.instance_id} FAILED to start container!\n'
+            )
             logger.exception(e)
             self.close(close_client=False)
             raise e
 
-    @tenacity.retry(
-        stop=tenacity.stop_after_attempt(10),
-        wait=tenacity.wait_exponential(multiplier=2, min=10, max=60),
-    )
-    def _wait_until_alive(self):
-        init_msg = 'Runtime client initialized.'
+    def _refresh_logs(self):
         logger.debug('Getting container logs...')
 
-        # Print and clear the log buffer
         assert (
             self.log_buffer is not None
         ), 'Log buffer is expected to be initialized when container is started'
 
-        # Always process logs, regardless of startup_done status
         logs = self.log_buffer.get_and_clear()
         if logs:
             formatted_logs = '\n'.join([f'    |{log}' for log in logs])
             logger.info(
                 '\n'
-                + '-' * 30
+                + '-' * 35
                 + 'Container logs:'
-                + '-' * 30
+                + '-' * 35
                 + f'\n{formatted_logs}'
                 + '\n'
-                + '-' * 90
+                + '-' * 80
             )
-            # Check for initialization message even if startup_done is True
-            if any(init_msg in log for log in logs):
-                self.startup_done = True
 
-        if not self.startup_done:
-            attempts = 0
-            while not self.startup_done and attempts < 10:
-                attempts += 1
-                time.sleep(1)
-                logs = self.log_buffer.get_and_clear()
-                if logs:
-                    formatted_logs = '\n'.join([f'    |{log}' for log in logs])
-                    logger.info(
-                        '\n'
-                        + '-' * 30
-                        + 'Container logs:'
-                        + '-' * 30
-                        + f'\n{formatted_logs}'
-                        + '\n'
-                        + '-' * 90
-                    )
-                    if any(init_msg in log for log in logs):
-                        self.startup_done = True
-                        break
+    @tenacity.retry(
+        stop=tenacity.stop_after_delay(120) | stop_if_should_exit(),
+        wait=tenacity.wait_exponential(multiplier=2, min=1, max=20),
+        reraise=(ConnectionRefusedError,),
+    )
+    def _wait_until_alive(self):
+        self._refresh_logs()
+        if not (self.log_buffer and self.log_buffer.client_ready):
+            raise RuntimeError('Runtime client is not ready.')
 
-        response = self.session.get(f'{self.api_url}/alive')
+        response = send_request_with_retry(
+            self.session,
+            'GET',
+            f'{self.api_url}/alive',
+            retry_exceptions=[ConnectionRefusedError],
+            timeout=300,  # 5 minutes gives the container time to be alive 🧟‍♂️
+        )
         if response.status_code == 200:
             return
         else:
@@ -300,28 +348,44 @@ class EventStreamRuntime(Runtime):
             logger.error(msg)
             raise RuntimeError(msg)
 
-    @property
-    def sandbox_workspace_dir(self):
-        return self.config.workspace_mount_path_in_sandbox
+    def close(self, close_client: bool = True, rm_all_containers: bool = True):
+        """Closes the EventStreamRuntime and associated objects
 
-    def close(self, close_client: bool = True):
+        Parameters:
+        - close_client (bool): Whether to close the DockerClient
+        - rm_all_containers (bool): Whether to remove all containers with the 'openhands-sandbox-' prefix
+        """
+
         if self.log_buffer:
             self.log_buffer.close()
 
         if self.session:
             self.session.close()
 
-        containers = self.docker_client.containers.list(all=True)
-        for container in containers:
-            try:
-                if container.name.startswith(self.container_name_prefix):
-                    logs = container.logs(tail=1000).decode('utf-8')
-                    logger.debug(
-                        f'==== Container logs ====\n{logs}\n==== End of container logs ===='
-                    )
-                    container.remove(force=True)
-            except docker.errors.NotFound:
-                pass
+        try:
+            containers = self.docker_client.containers.list(all=True)
+            for container in containers:
+                try:
+                    # If the app doesn't shut down properly, it can leave runtime containers on the system. This ensures
+                    # that all 'openhands-sandbox-' containers are removed as well.
+                    if rm_all_containers and container.name.startswith(
+                        self.container_name_prefix
+                    ):
+                        container.remove(force=True)
+                    elif container.name == self.container_name:
+                        if not self.skip_container_logs:
+                            logs = container.logs(tail=1000).decode('utf-8')
+                            logger.debug(
+                                f'==== Container logs on close ====\n{logs}\n==== End of container logs ===='
+                            )
+                        container.remove(force=True)
+                except docker.errors.APIError:
+                    pass
+                except docker.errors.NotFound:
+                    pass
+        except docker.errors.NotFound:  # yes, this can happen!
+            pass
+
         if close_client:
             self.docker_client.close()
 
@@ -333,6 +397,12 @@ class EventStreamRuntime(Runtime):
         with self.action_semaphore:
             if not action.runnable:
                 return NullObservation('')
+            if (
+                hasattr(action, 'is_confirmed')
+                and action.is_confirmed
+                == ActionConfirmationStatus.AWAITING_CONFIRMATION
+            ):
+                return NullObservation('')
             action_type = action.action  # type: ignore[attr-defined]
             if action_type not in ACTION_TYPE_TO_CLASS:
                 return ErrorObservation(f'Action {action_type} does not exist.')
@@ -340,14 +410,22 @@ class EventStreamRuntime(Runtime):
                 return ErrorObservation(
                     f'Action {action_type} is not supported in the current runtime.'
                 )
+            if (
+                hasattr(action, 'is_confirmed')
+                and action.is_confirmed == ActionConfirmationStatus.REJECTED
+            ):
+                return UserRejectObservation(
+                    'Action has been rejected by the user! Waiting for further user input.'
+                )
 
-            logger.info('Awaiting session')
-            self._wait_until_alive()
+            self._refresh_logs()
 
             assert action.timeout is not None
 
             try:
-                response = self.session.post(
+                response = send_request_with_retry(
+                    self.session,
+                    'POST',
                     f'{self.api_url}/execute_action',
                     json={'action': event_to_dict(action)},
                     timeout=action.timeout,
@@ -356,17 +434,21 @@ class EventStreamRuntime(Runtime):
                     output = response.json()
                     obs = observation_from_dict(output)
                     obs._cause = action.id  # type: ignore[attr-defined]
-                    return obs
                 else:
+                    logger.debug(f'action: {action}')
+                    logger.debug(f'response: {response}')
                     error_message = response.text
                     logger.error(f'Error from server: {error_message}')
-                    obs = ErrorObservation(f'Command execution failed: {error_message}')
+                    obs = ErrorObservation(f'Action execution failed: {error_message}')
             except requests.Timeout:
                 logger.error('No response received within the timeout period.')
-                obs = ErrorObservation('Command execution timed out')
+                obs = ErrorObservation(
+                    f'Action execution timed out after {action.timeout} seconds.'
+                )
             except Exception as e:
-                logger.error(f'Error during command execution: {e}')
-                obs = ErrorObservation(f'Command execution failed: {str(e)}')
+                logger.error(f'Error during action execution: {e}')
+                obs = ErrorObservation(f'Action execution failed: {str(e)}')
+            self._refresh_logs()
             return obs
 
     def run(self, action: CmdRunAction) -> Observation:
@@ -397,7 +479,7 @@ class EventStreamRuntime(Runtime):
         if not os.path.exists(host_src):
             raise FileNotFoundError(f'Source file {host_src} does not exist')
 
-        self._wait_until_alive()
+        self._refresh_logs()
         try:
             if recursive:
                 # For recursive copy, create a zip file
@@ -422,8 +504,13 @@ class EventStreamRuntime(Runtime):
 
             params = {'destination': sandbox_dest, 'recursive': str(recursive).lower()}
 
-            response = self.session.post(
-                f'{self.api_url}/upload_file', files=upload_data, params=params
+            response = send_request_with_retry(
+                self.session,
+                'POST',
+                f'{self.api_url}/upload_file',
+                files=upload_data,
+                params=params,
+                timeout=300,
             )
             if response.status_code == 200:
                 return
@@ -439,19 +526,26 @@ class EventStreamRuntime(Runtime):
             if recursive:
                 os.unlink(temp_zip_path)
             logger.info(f'Copy completed: host:{host_src} -> runtime:{sandbox_dest}')
+            self._refresh_logs()
 
     def list_files(self, path: str | None = None) -> list[str]:
         """List files in the sandbox.
 
         If path is None, list files in the sandbox's initial working directory (e.g., /workspace).
         """
-        self._wait_until_alive()
+        self._refresh_logs()
         try:
             data = {}
             if path is not None:
                 data['path'] = path
 
-            response = self.session.post(f'{self.api_url}/list_files', json=data)
+            response = send_request_with_retry(
+                self.session,
+                'POST',
+                f'{self.api_url}/list_files',
+                json=data,
+                timeout=30,  # 30 seconds because the container should already be alive
+            )
             if response.status_code == 200:
                 response_json = response.json()
                 assert isinstance(response_json, list)
@@ -463,3 +557,49 @@ class EventStreamRuntime(Runtime):
             raise TimeoutError('List files operation timed out')
         except Exception as e:
             raise RuntimeError(f'List files operation failed: {str(e)}')
+
+    def copy_from(self, path: str) -> bytes:
+        """Zip all files in the sandbox and return as a stream of bytes."""
+        self._refresh_logs()
+        try:
+            params = {'path': path}
+            response = send_request_with_retry(
+                self.session,
+                'GET',
+                f'{self.api_url}/download_files',
+                params=params,
+                stream=True,
+                timeout=30,
+            )
+            if response.status_code == 200:
+                data = response.content
+                return data
+            else:
+                error_message = response.text
+                raise Exception(f'Copy operation failed: {error_message}')
+        except requests.Timeout:
+            raise TimeoutError('Copy operation timed out')
+        except Exception as e:
+            raise RuntimeError(f'Copy operation failed: {str(e)}')
+
+    def _is_port_in_use_docker(self, port):
+        containers = self.docker_client.containers.list()
+        for container in containers:
+            container_ports = container.ports
+            if str(port) in str(container_ports):
+                return True
+        return False
+
+    def _find_available_port(self, max_attempts=5):
+        port = 39999
+        for _ in range(max_attempts):
+            port = find_available_tcp_port(30000, 39999)
+            if not self._is_port_in_use_docker(port):
+                return port
+        # If no port is found after max_attempts, return the last tried port
+        return port
+
+    def send_status_message(self, message: str):
+        """Sends a status message if the callback function was provided."""
+        if self.status_message_callback:
+            self.status_message_callback(message)

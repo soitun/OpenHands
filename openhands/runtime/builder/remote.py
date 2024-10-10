@@ -7,6 +7,11 @@ import requests
 
 from openhands.core.logger import openhands_logger as logger
 from openhands.runtime.builder import RuntimeBuilder
+from openhands.runtime.utils.request import send_request_with_retry
+from openhands.runtime.utils.shutdown_listener import (
+    should_continue,
+    sleep_if_should_continue,
+)
 
 
 class RemoteRuntimeBuilder(RuntimeBuilder):
@@ -15,6 +20,8 @@ class RemoteRuntimeBuilder(RuntimeBuilder):
     def __init__(self, api_url: str, api_key: str):
         self.api_url = api_url
         self.api_key = api_key
+        self.session = requests.Session()
+        self.session.headers.update({'X-API-Key': self.api_key})
 
     def build(self, path: str, tags: list[str]) -> str:
         """Builds a Docker image using the Runtime API's /build endpoint."""
@@ -37,9 +44,14 @@ class RemoteRuntimeBuilder(RuntimeBuilder):
         for tag in tags[1:]:
             files.append(('tags', (None, tag)))
 
-        # Send the POST request to /build
-        headers = {'X-API-Key': self.api_key}
-        response = requests.post(f'{self.api_url}/build', files=files, headers=headers)
+        # Send the POST request to /build (Begins the build process)
+        response = send_request_with_retry(
+            self.session,
+            'POST',
+            f'{self.api_url}/build',
+            files=files,
+            timeout=30,
+        )
 
         if response.status_code != 202:
             logger.error(f'Build initiation failed: {response.text}')
@@ -52,15 +64,17 @@ class RemoteRuntimeBuilder(RuntimeBuilder):
         # Poll /build_status until the build is complete
         start_time = time.time()
         timeout = 30 * 60  # 20 minutes in seconds
-        while True:
+        while should_continue():
             if time.time() - start_time > timeout:
                 logger.error('Build timed out after 30 minutes')
                 raise RuntimeError('Build timed out after 30 minutes')
 
-            status_response = requests.get(
+            status_response = send_request_with_retry(
+                self.session,
+                'GET',
                 f'{self.api_url}/build_status',
                 params={'build_id': build_id},
-                headers=headers,
+                timeout=30,
             )
 
             if status_response.status_code != 200:
@@ -90,14 +104,20 @@ class RemoteRuntimeBuilder(RuntimeBuilder):
                 raise RuntimeError(error_message)
 
             # Wait before polling again
-            time.sleep(5)
+            sleep_if_should_continue(30)
 
-    def image_exists(self, image_name: str) -> bool:
+        raise RuntimeError('Build interrupted (likely received SIGTERM or SIGINT).')
+
+    def image_exists(self, image_name: str, pull_from_repo: bool = True) -> bool:
         """Checks if an image exists in the remote registry using the /image_exists endpoint."""
         params = {'image': image_name}
-        session = requests.Session()
-        session.headers.update({'X-API-Key': self.api_key})
-        response = session.get(f'{self.api_url}/image_exists', params=params)
+        response = send_request_with_retry(
+            self.session,
+            'GET',
+            f'{self.api_url}/image_exists',
+            params=params,
+            timeout=30,
+        )
 
         if response.status_code != 200:
             logger.error(f'Failed to check image existence: {response.text}')

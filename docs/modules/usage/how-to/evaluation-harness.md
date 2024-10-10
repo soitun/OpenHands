@@ -1,4 +1,4 @@
-# Contribute to OpenHands Evaluation Harness
+# Evaluation
 
 This guide provides an overview of how to integrate your own evaluation benchmark into the OpenHands framework.
 
@@ -12,7 +12,7 @@ Here's an example configuration file you can use to define and use multiple LLMs
 ```toml
 [llm]
 # IMPORTANT: add your API key here, and set the model to the one you want to evaluate
-model = "gpt-4o-2024-05-13"
+model = "claude-3-5-sonnet-20240620"
 api_key = "sk-XXX"
 
 [llm.eval_gpt4_1106_preview_llm]
@@ -84,7 +84,7 @@ To create an evaluation workflow for your benchmark, follow these steps:
 
 1. Import relevant OpenHands utilities:
    ```python
-    import agenthub
+    import openhands.agenthub
     from evaluation.utils.shared import (
         EvalMetadata,
         EvalOutput,
@@ -136,7 +136,7 @@ To create an evaluation workflow for your benchmark, follow these steps:
    ```python
    def process_instance(instance: pd.Series, metadata: EvalMetadata) -> EvalOutput:
        config = get_config(instance, metadata)
-       runtime = create_runtime(config, sid=instance.instance_id)
+       runtime = create_runtime(config)
        initialize_runtime(runtime, instance)
 
        instruction = get_instruction(instance, metadata)
